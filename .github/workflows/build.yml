@@ -12,6 +12,14 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 9.2.0
+      - name: Fix renamed files
+        run: |
+          [ -f "build (1).gradle" ] && cp "build (1).gradle" build.gradle
+          [ -f "settings (1).gradle" ] && cp "settings (1).gradle" settings.gradle
+          [ -f "gradle (1).properties" ] && cp "gradle (1).properties" gradle.properties
+          [ -f "LICENSE (1)" ] && cp "LICENSE (1)" LICENSE
+          ls
+          exit 0
       - run: python3 unpack.py
       - run: gradle build
       - uses: actions/upload-artifact@v4
