@@ -18,9 +18,20 @@ jobs:
           [ -f "settings (1).gradle" ] && cp "settings (1).gradle" settings.gradle
           [ -f "gradle (1).properties" ] && cp "gradle (1).properties" gradle.properties
           [ -f "LICENSE (1)" ] && cp "LICENSE (1)" LICENSE
-          ls
           exit 0
       - run: python3 unpack.py
+      - name: Fix sound API
+        run: |
+          python3 - <<'PY'
+          import re
+          p = 'src/main/java/com/markpoint/client/ClientMarks.java'
+          s = open(p, encoding='utf-8').read()
+          pat = r'MinecraftClient\.getInstance\(\)\.getSoundManager\(\)\.play\(\s*PositionedSoundInstance\.master\(SoundEvents\.BLOCK_NOTE_BLOCK_BELL\.value\(\), pitch\)\);'
+          new = 'if (MinecraftClient.getInstance().player != null) MinecraftClient.getInstance().player.playSound(SoundEvents.BLOCK_NOTE_BLOCK_BELL.value(), 1.0f, pitch);'
+          s2, n = re.subn(pat, new, s)
+          assert n == 1, n
+          open(p, 'w', encoding='utf-8').write(s2)
+          PY
       - run: gradle build
       - uses: actions/upload-artifact@v4
         with:
