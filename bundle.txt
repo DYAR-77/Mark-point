@@ -1,0 +1,1174 @@
+=== FILE: src/main/java/com/markpoint/MarkData.java ===
+package com.markpoint;
+
+import net.minecraft.network.PacketByteBuf;
+
+import java.util.UUID;
+
+public record MarkData(UUID id, UUID owner, String ownerName, int type,
+					   double x, double y, double z,
+					   String label, int color, int durationSec) {
+
+	public static final int MAX_LABEL = 32;
+
+	public void write(PacketByteBuf buf) {
+		buf.writeUuid(id);
+		buf.writeUuid(owner);
+		buf.writeString(ownerName == null ? "" : ownerName, 64);
+		buf.writeInt(type);
+		buf.writeDouble(x);
+		buf.writeDouble(y);
+		buf.writeDouble(z);
+		buf.writeString(label == null ? "" : label, 64);
+		buf.writeInt(color);
+		buf.writeInt(durationSec);
+	}
+
+	public static MarkData read(PacketByteBuf buf) {
+		return new MarkData(
+				buf.readUuid(),
+				buf.readUuid(),
+				buf.readString(64),
+				buf.readInt(),
+				buf.readDouble(),
+				buf.readDouble(),
+				buf.readDouble(),
+				buf.readString(64),
+				buf.readInt(),
+				buf.readInt());
+	}
+
+	public MarkData withDuration(int seconds) {
+		return new MarkData(id, owner, ownerName, type, x, y, z, label, color, seconds);
+	}
+}
+=== FILE: src/main/java/com/markpoint/MarkPointMod.java ===
+package com.markpoint;
+
+import com.markpoint.network.MarkPayload;
+import com.markpoint.network.RemovePayload;
+import com.markpoint.server.ServerMarkManager;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+
+public class MarkPointMod implements ModInitializer {
+	public static final String MOD_ID = "markpoint";
+
+	@Override
+	public void onInitialize() {
+		PayloadTypeRegistry.playC2S().register(MarkPayload.ID, MarkPayload.CODEC);
+		PayloadTypeRegistry.playS2C().register(MarkPayload.ID, MarkPayload.CODEC);
+		PayloadTypeRegistry.playC2S().register(RemovePayload.ID, RemovePayload.CODEC);
+		PayloadTypeRegistry.playS2C().register(RemovePayload.ID, RemovePayload.CODEC);
+
+		ServerMarkManager.init();
+	}
+}
+=== FILE: src/main/java/com/markpoint/MarkType.java ===
+package com.markpoint;
+
+public enum MarkType {
+	LOCATION(0xFF3FA9F5, "location"),
+	ENEMY(0xFFE53935, "enemy"),
+	DANGER(0xFFFF9800, "danger"),
+	RESOURCE(0xFF00E5FF, "resource"),
+	CHEST(0xFFFFD54F, "chest"),
+	HELP(0xFFE040FB, "help"),
+	GOTO(0xFF66BB6A, "goto"),
+	CUSTOM(0xFFFFFFFF, "custom");
+
+	public final int defaultColor;
+	public final String id;
+
+	MarkType(int defaultColor, String id) {
+		this.defaultColor = defaultColor;
+		this.id = id;
+	}
+
+	public String key() {
+		return "markpoint.type." + id;
+	}
+
+	public static MarkType byOrdinal(int i) {
+		MarkType[] v = values();
+		return v[Math.floorMod(i, v.length)];
+	}
+}
+=== FILE: src/main/java/com/markpoint/server/ServerConfig.java ===
+package com.markpoint.server;
+
+import net.fabricmc.loader.api.FabricLoader;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Properties;
+
+/** Server-side permissions for sharing marks. File: config/markpoint-server.properties */
+public final class ServerConfig {
+	public boolean shareEnabled = true;
+	public int maxMarksPerPlayer = 10;
+	public int maxDurationSec = 600;
+	public boolean allowPermanent = true;
+	public int maxRange = 4096;
+
+	private static Path path() {
+		return FabricLoader.getInstance().getConfigDir().resolve("markpoint-server.properties");
+	}
+
+	public static ServerConfig load() {
+		ServerConfig c = new ServerConfig();
+		Path p = path();
+		if (Files.exists(p)) {
+			Properties props = new Properties();
+			try (Reader r = Files.newBufferedReader(p)) {
+				props.load(r);
+				c.shareEnabled = Boolean.parseBoolean(props.getProperty("shareEnabled", "true"));
+				c.maxMarksPerPlayer = Math.max(1, parse(props, "maxMarksPerPlayer", 10));
+				c.maxDurationSec = Math.max(0, parse(props, "maxDurationSec", 600));
+				c.allowPermanent = Boolean.parseBoolean(props.getProperty("allowPermanent", "true"));
+				c.maxRange = Math.max(16, parse(props, "maxRange", 4096));
+			} catch (IOException ignored) {
+			}
+		} else {
+			c.save();
+		}
+		return c;
+	}
+
+	private static int parse(Properties props, String key, int def) {
+		try {
+			return Integer.parseInt(props.getProperty(key, String.valueOf(def)).trim());
+		} catch (NumberFormatException e) {
+			return def;
+		}
+	}
+
+	public void save() {
+		Properties props = new Properties();
+		props.setProperty("shareEnabled", String.valueOf(shareEnabled));
+		props.setProperty("maxMarksPerPlayer", String.valueOf(maxMarksPerPlayer));
+		props.setProperty("maxDurationSec", String.valueOf(maxDurationSec));
+		props.setProperty("allowPermanent", String.valueOf(allowPermanent));
+		props.setProperty("maxRange", String.valueOf(maxRange));
+		try (Writer w = Files.newBufferedWriter(path())) {
+			props.store(w, "MarkPoint server config (maxDurationSec 0 = unlimited)");
+		} catch (IOException ignored) {
+		}
+	}
+}
+=== FILE: src/main/java/com/markpoint/server/ServerMarkManager.java ===
+package com.markpoint.server;
+
+import com.markpoint.MarkData;
+import com.markpoint.MarkType;
+import com.markpoint.network.MarkPayload;
+import com.markpoint.network.RemovePayload;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.network.packet.CustomPayload;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
+
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.UUID;
+
+public final class ServerMarkManager {
+	private record Entry(MarkData data, long expiresAt) {
+	}
+
+	private static final Map<UUID, Entry> MARKS = new LinkedHashMap<>();
+	private static ServerConfig cfg = new ServerConfig();
+
+	private ServerMarkManager() {
+	}
+
+	public static void init() {
+		ServerLifecycleEvents.SERVER_STARTING.register(server -> {
+			MARKS.clear();
+			cfg = ServerConfig.load();
+		});
+		ServerLifecycleEvents.SERVER_STOPPED.register(server -> MARKS.clear());
+
+		ServerPlayNetworking.registerGlobalReceiver(MarkPayload.ID,
+				(payload, ctx) -> onCreate(ctx.player(), ctx.server(), payload.data()));
+		ServerPlayNetworking.registerGlobalReceiver(RemovePayload.ID,
+				(payload, ctx) -> onRemove(ctx.player(), ctx.server(), payload.id()));
+
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+			if (!cfg.shareEnabled) return;
+			long now = System.currentTimeMillis();
+			for (Entry e : MARKS.values()) {
+				int dur = 0;
+				if (e.expiresAt() > 0) {
+					dur = (int) Math.max(1, (e.expiresAt() - now + 999) / 1000);
+				}
+				sender.sendPacket(new MarkPayload(e.data().withDuration(dur)));
+			}
+		});
+
+		ServerTickEvents.END_SERVER_TICK.register(server -> {
+			if (server.getTicks() % 20 != 0 || MARKS.isEmpty()) return;
+			long now = System.currentTimeMillis();
+			Iterator<Entry> it = MARKS.values().iterator();
+			while (it.hasNext()) {
+				Entry e = it.next();
+				if (e.expiresAt() > 0 && now >= e.expiresAt()) {
+					it.remove();
+					broadcast(server, new RemovePayload(e.data().id()));
+				}
+			}
+		});
+	}
+
+	private static void onCreate(ServerPlayerEntity p, MinecraftServer server, MarkData d) {
+		if (!cfg.shareEnabled) return;
+
+		double dx = d.x() - p.getX();
+		double dy = d.y() - p.getY();
+		double dz = d.z() - p.getZ();
+		double distSq = dx * dx + dy * dy + dz * dz;
+		if (!Double.isFinite(distSq) || distSq > (double) cfg.maxRange * cfg.maxRange) return;
+
+		int dur = Math.max(0, d.durationSec());
+		if (dur == 0 && !cfg.allowPermanent) {
+			dur = cfg.maxDurationSec > 0 ? Math.min(60, cfg.maxDurationSec) : 60;
+		} else if (dur > 0 && cfg.maxDurationSec > 0 && dur > cfg.maxDurationSec) {
+			dur = cfg.maxDurationSec;
+		}
+
+		String label = d.label() == null ? "" : d.label();
+		if (label.length() > MarkData.MAX_LABEL) label = label.substring(0, MarkData.MAX_LABEL);
+
+		int type = Math.floorMod(d.type(), MarkType.values().length);
+		UUID owner = p.getUuid();
+
+		// enforce per-player limit: drop the oldest marks of this player
+		while (countOf(owner) >= cfg.maxMarksPerPlayer) {
+			UUID oldest = null;
+			for (Entry e : MARKS.values()) {
+				if (e.data().owner().equals(owner)) {
+					oldest = e.data().id();
+					break;
+				}
+			}
+			if (oldest == null) break;
+			MARKS.remove(oldest);
+			broadcast(server, new RemovePayload(oldest));
+		}
+
+		MarkData clean = new MarkData(UUID.randomUUID(), owner, p.getName().getString(), type,
+				d.x(), d.y(), d.z(), label, d.color() | 0xFF000000, dur);
+		long expires = dur > 0 ? System.currentTimeMillis() + dur * 1000L : 0;
+		MARKS.put(clean.id(), new Entry(clean, expires));
+		broadcast(server, new MarkPayload(clean));
+	}
+
+	private static void onRemove(ServerPlayerEntity p, MinecraftServer server, UUID id) {
+		Entry e = MARKS.get(id);
+		if (e == null || !e.data().owner().equals(p.getUuid())) return;
+		MARKS.remove(id);
+		broadcast(server, new RemovePayload(id));
+	}
+
+	private static int countOf(UUID owner) {
+		int n = 0;
+		for (Entry e : MARKS.values()) {
+			if (e.data().owner().equals(owner)) n++;
+		}
+		return n;
+	}
+
+	private static void broadcast(MinecraftServer server, CustomPayload payload) {
+		for (ServerPlayerEntity pl : server.getPlayerManager().getPlayerList()) {
+			if (ServerPlayNetworking.canSend(pl, payload.getId())) {
+				ServerPlayNetworking.send(pl, payload);
+			}
+		}
+	}
+}
+=== FILE: src/main/java/com/markpoint/network/MarkPayload.java ===
+package com.markpoint.network;
+
+import com.markpoint.MarkData;
+import com.markpoint.MarkPointMod;
+import net.minecraft.network.PacketByteBuf;
+import net.minecraft.network.codec.PacketCodec;
+import net.minecraft.network.packet.CustomPayload;
+import net.minecraft.util.Identifier;
+
+/** Used both client->server (create request) and server->client (mark broadcast). */
+public record MarkPayload(MarkData data) implements CustomPayload {
+	public static final CustomPayload.Id<MarkPayload> ID =
+			new CustomPayload.Id<>(Identifier.of(MarkPointMod.MOD_ID, "mark"));
+
+	public static final PacketCodec<PacketByteBuf, MarkPayload> CODEC = PacketCodec.of(
+			(payload, buf) -> payload.data.write(buf),
+			buf -> new MarkPayload(MarkData.read(buf)));
+
+	@Override
+	public CustomPayload.Id<? extends CustomPayload> getId() {
+		return ID;
+	}
+}
+=== FILE: src/main/java/com/markpoint/network/RemovePayload.java ===
+package com.markpoint.network;
+
+import com.markpoint.MarkPointMod;
+import net.minecraft.network.PacketByteBuf;
+import net.minecraft.network.codec.PacketCodec;
+import net.minecraft.network.packet.CustomPayload;
+import net.minecraft.util.Identifier;
+
+import java.util.UUID;
+
+/** Used both client->server (remove request) and server->client (mark removed). */
+public record RemovePayload(UUID id) implements CustomPayload {
+	public static final CustomPayload.Id<RemovePayload> ID =
+			new CustomPayload.Id<>(Identifier.of(MarkPointMod.MOD_ID, "remove"));
+
+	public static final PacketCodec<PacketByteBuf, RemovePayload> CODEC = PacketCodec.of(
+			(payload, buf) -> buf.writeUuid(payload.id),
+			buf -> new RemovePayload(buf.readUuid()));
+
+	@Override
+	public CustomPayload.Id<? extends CustomPayload> getId() {
+		return ID;
+	}
+}
+=== FILE: src/main/java/com/markpoint/client/ClientConfig.java ===
+package com.markpoint.client;
+
+import com.markpoint.MarkType;
+import net.fabricmc.loader.api.FabricLoader;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Properties;
+
+/** Client settings. File: config/markpoint-client.properties */
+public final class ClientConfig {
+	public static final int[] DURATIONS = {5, 15, 30, 60, 300, 0}; // 0 = permanent
+	public static final int[] DISTANCES = {64, 128, 256, 512, 1000, 2000};
+	public static final float[] SCALES = {0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
+	public static final int[] PALETTE = {
+			0xFF3FA9F5, 0xFFE53935, 0xFFFF9800, 0xFF00E5FF, 0xFFFFD54F,
+			0xFFE040FB, 0xFF66BB6A, 0xFFFFFFFF, 0xFFFF4081, 0xFF8D6E63
+	};
+
+	public static int maxDistance = 1000;
+	public static float scale = 1.0f;
+	public static int duration = 30;
+	public static boolean sounds = true;
+	public static boolean animations = true;
+	public static boolean showDistance = true;
+	public static boolean showOwner = true;
+	public static boolean showOffscreen = true;
+	public static int enabledMask = 0xFF;
+	public static int favorite = 0;
+	public static String customLabel = "Mark";
+	public static final int[] colors = new int[MarkType.values().length];
+
+	static {
+		resetColors();
+	}
+
+	private ClientConfig() {
+	}
+
+	private static void resetColors() {
+		for (MarkType t : MarkType.values()) colors[t.ordinal()] = t.defaultColor;
+	}
+
+	public static boolean enabled(MarkType t) {
+		return ((enabledMask >> t.ordinal()) & 1) != 0;
+	}
+
+	public static void toggle(MarkType t) {
+		enabledMask ^= (1 << t.ordinal());
+		if (enabledMask == 0) enabledMask |= (1 << t.ordinal()); // keep at least one
+	}
+
+	public static List<MarkType> enabledTypes() {
+		List<MarkType> list = new ArrayList<>();
+		for (MarkType t : MarkType.values()) if (enabled(t)) list.add(t);
+		return list;
+	}
+
+	public static MarkType favoriteType() {
+		return MarkType.byOrdinal(favorite);
+	}
+
+	public static int cycle(int[] arr, int cur) {
+		int idx = -1;
+		for (int i = 0; i < arr.length; i++) if (arr[i] == cur) idx = i;
+		return arr[(idx + 1) % arr.length];
+	}
+
+	public static float cycle(float[] arr, float cur) {
+		int idx = -1;
+		for (int i = 0; i < arr.length; i++) if (Math.abs(arr[i] - cur) < 0.001f) idx = i;
+		return arr[(idx + 1) % arr.length];
+	}
+
+	private static Path path() {
+		return FabricLoader.getInstance().getConfigDir().resolve("markpoint-client.properties");
+	}
+
+	private static int i(Properties p, String k, int d) {
+		try {
+			return Integer.parseInt(p.getProperty(k, String.valueOf(d)).trim());
+		} catch (NumberFormatException e) {
+			return d;
+		}
+	}
+
+	private static float f(Properties p, String k, float d) {
+		try {
+			return Float.parseFloat(p.getProperty(k, String.valueOf(d)).trim());
+		} catch (NumberFormatException e) {
+			return d;
+		}
+	}
+
+	private static boolean b(Properties p, String k, boolean d) {
+		return Boolean.parseBoolean(p.getProperty(k, String.valueOf(d)));
+	}
+
+	public static void load() {
+		Path path = path();
+		if (!Files.exists(path)) {
+			save();
+			return;
+		}
+		Properties p = new Properties();
+		try (Reader r = Files.newBufferedReader(path)) {
+			p.load(r);
+		} catch (IOException e) {
+			return;
+		}
+		maxDistance = i(p, "maxDistance", maxDistance);
+		scale = f(p, "scale", scale);
+		duration = i(p, "duration", duration);
+		sounds = b(p, "sounds", sounds);
+		animations = b(p, "animations", animations);
+		showDistance = b(p, "showDistance", showDistance);
+		showOwner = b(p, "showOwner", showOwner);
+		showOffscreen = b(p, "showOffscreen", showOffscreen);
+		enabledMask = i(p, "enabledMask", enabledMask);
+		if (enabledMask == 0) enabledMask = 0xFF;
+		favorite = Math.floorMod(i(p, "favorite", favorite), MarkType.values().length);
+		customLabel = p.getProperty("customLabel", customLabel);
+		for (MarkType t : MarkType.values()) {
+			colors[t.ordinal()] = i(p, "color." + t.id, t.defaultColor) | 0xFF000000;
+		}
+	}
+
+	public static void save() {
+		Properties p = new Properties();
+		p.setProperty("maxDistance", String.valueOf(maxDistance));
+		p.setProperty("scale", String.valueOf(scale));
+		p.setProperty("duration", String.valueOf(duration));
+		p.setProperty("sounds", String.valueOf(sounds));
+		p.setProperty("animations", String.valueOf(animations));
+		p.setProperty("showDistance", String.valueOf(showDistance));
+		p.setProperty("showOwner", String.valueOf(showOwner));
+		p.setProperty("showOffscreen", String.valueOf(showOffscreen));
+		p.setProperty("enabledMask", String.valueOf(enabledMask));
+		p.setProperty("favorite", String.valueOf(favorite));
+		p.setProperty("customLabel", customLabel);
+		for (MarkType t : MarkType.values()) {
+			p.setProperty("color." + t.id, String.valueOf(colors[t.ordinal()]));
+		}
+		try (Writer w = Files.newBufferedWriter(path())) {
+			p.store(w, "MarkPoint client config (duration 0 = permanent)");
+		} catch (IOException ignored) {
+		}
+	}
+}
+=== FILE: src/main/java/com/markpoint/client/ClientMarks.java ===
+package com.markpoint.client;
+
+import com.markpoint.MarkData;
+import com.markpoint.MarkType;
+import com.markpoint.network.MarkPayload;
+import com.markpoint.network.RemovePayload;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.sound.PositionedSoundInstance;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.text.Text;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.EntityHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.Vec3d;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+public final class ClientMarks {
+	public static final class Mark {
+		public final MarkData data;
+		public final long expiresAt;
+
+		Mark(MarkData data, long expiresAt) {
+			this.data = data;
+			this.expiresAt = expiresAt;
+		}
+	}
+
+	private static final Map<UUID, Mark> MARKS = new LinkedHashMap<>();
+
+	private ClientMarks() {
+	}
+
+	public static Collection<Mark> all() {
+		return MARKS.values();
+	}
+
+	public static void add(MarkData d) {
+		long exp = d.durationSec() > 0 ? System.currentTimeMillis() + d.durationSec() * 1000L : 0;
+		MARKS.put(d.id(), new Mark(d, exp));
+		playSound(MarkType.byOrdinal(d.type()));
+	}
+
+	public static void remove(UUID id) {
+		MARKS.remove(id);
+	}
+
+	public static void clear() {
+		MARKS.clear();
+	}
+
+	public static void prune() {
+		long now = System.currentTimeMillis();
+		MARKS.values().removeIf(m -> m.expiresAt > 0 && now >= m.expiresAt);
+	}
+
+	private static void playSound(MarkType type) {
+		if (!ClientConfig.sounds) return;
+		float pitch = (type == MarkType.ENEMY || type == MarkType.DANGER) ? 0.7f : 1.3f;
+		MinecraftClient.getInstance().getSoundManager().play(
+				PositionedSoundInstance.master(SoundEvents.BLOCK_NOTE_BLOCK_BELL.value(), pitch));
+	}
+
+	/** Point the player is looking at (entity, block, or far point in the air). */
+	public static Vec3d aimPoint(MinecraftClient mc) {
+		if (mc.player == null) return Vec3d.ZERO;
+		HitResult hit = mc.player.raycast(256.0, 1.0f, false);
+		if (mc.crosshairTarget instanceof EntityHitResult e) {
+			return e.getPos();
+		}
+		if (hit instanceof BlockHitResult b && hit.getType() == HitResult.Type.BLOCK) {
+			return Vec3d.ofCenter(b.getBlockPos()).add(0, 1.0, 0);
+		}
+		return hit.getPos();
+	}
+
+	public static void create(MarkType type, Vec3d pos) {
+		MinecraftClient mc = MinecraftClient.getInstance();
+		if (mc.player == null) return;
+		String label = type == MarkType.CUSTOM ? ClientConfig.customLabel : "";
+		if (label.length() > MarkData.MAX_LABEL) label = label.substring(0, MarkData.MAX_LABEL);
+		MarkData d = new MarkData(UUID.randomUUID(), mc.player.getUuid(), mc.player.getName().getString(),
+				type.ordinal(), pos.x, pos.y, pos.z, label,
+				ClientConfig.colors[type.ordinal()], ClientConfig.duration);
+		if (ClientPlayNetworking.canSend(MarkPayload.ID)) {
+			ClientPlayNetworking.send(new MarkPayload(d)); // server echoes it back to everyone
+		} else {
+			add(d); // local-only mark
+		}
+	}
+
+	public static void clearMine() {
+		MinecraftClient mc = MinecraftClient.getInstance();
+		if (mc.player == null) return;
+		UUID me = mc.player.getUuid();
+		List<UUID> ids = new ArrayList<>();
+		for (Mark m : MARKS.values()) if (m.data.owner().equals(me)) ids.add(m.data.id());
+		for (UUID id : ids) requestRemove(id);
+	}
+
+	/** Deletes my mark closest to the crosshair (within ~6 degrees). */
+	public static void removeLookedAt() {
+		MinecraftClient mc = MinecraftClient.getInstance();
+		if (mc.player == null) return;
+		Vec3d eye = mc.player.getEyePos();
+		Vec3d look = mc.player.getRotationVec(1.0f);
+		UUID me = mc.player.getUuid();
+		double best = Math.cos(Math.toRadians(6.0));
+		UUID bestId = null;
+		for (Mark m : MARKS.values()) {
+			if (!m.data.owner().equals(me)) continue;
+			Vec3d dir = new Vec3d(m.data.x() - eye.x, m.data.y() - eye.y, m.data.z() - eye.z);
+			double len = dir.length();
+			if (len < 1e-4) continue;
+			double dot = dir.dotProduct(look) / len;
+			if (dot > best) {
+				best = dot;
+				bestId = m.data.id();
+			}
+		}
+		if (bestId != null) requestRemove(bestId);
+	}
+
+	private static void requestRemove(UUID id) {
+		if (ClientPlayNetworking.canSend(RemovePayload.ID)) {
+			ClientPlayNetworking.send(new RemovePayload(id));
+		}
+		// Local removal covers local-only marks (and is harmless if the server echoes it back).
+		MARKS.remove(id);
+	}
+
+	public static String displayLabel(MarkData d) {
+		if (d.label() != null && !d.label().isEmpty()) return d.label();
+		return Text.translatable(MarkType.byOrdinal(d.type()).key()).getString();
+	}
+}
+=== FILE: src/main/java/com/markpoint/client/MarkPointClient.java ===
+package com.markpoint.client;
+
+import com.markpoint.MarkPointMod;
+import com.markpoint.network.MarkPayload;
+import com.markpoint.network.RemovePayload;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.util.Identifier;
+import org.lwjgl.glfw.GLFW;
+
+public class MarkPointClient implements ClientModInitializer {
+	private static KeyBinding wheelKey;
+	private static KeyBinding quickKey;
+	private static KeyBinding deleteKey;
+	private static KeyBinding settingsKey;
+
+	@Override
+	public void onInitializeClient() {
+		ClientConfig.load();
+
+		KeyBinding.Category category = KeyBinding.Category.create(Identifier.of(MarkPointMod.MOD_ID, "main"));
+		wheelKey = KeyBindingHelper.registerKeyBinding(
+				new KeyBinding("key.markpoint.wheel", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_V, category));
+		quickKey = KeyBindingHelper.registerKeyBinding(
+				new KeyBinding("key.markpoint.quick", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_Z, category));
+		deleteKey = KeyBindingHelper.registerKeyBinding(
+				new KeyBinding("key.markpoint.delete", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_X, category));
+		settingsKey = KeyBindingHelper.registerKeyBinding(
+				new KeyBinding("key.markpoint.settings", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, category));
+
+		ClientPlayNetworking.registerGlobalReceiver(MarkPayload.ID,
+				(payload, ctx) -> ClientMarks.add(payload.data()));
+		ClientPlayNetworking.registerGlobalReceiver(RemovePayload.ID,
+				(payload, ctx) -> ClientMarks.remove(payload.id()));
+		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> ClientMarks.clear());
+
+		ClientTickEvents.END_CLIENT_TICK.register(client -> {
+			if (client.player == null) return;
+			while (wheelKey.wasPressed()) {
+				if (client.currentScreen == null) {
+					client.setScreen(new WheelScreen(ClientMarks.aimPoint(client)));
+				}
+			}
+			while (quickKey.wasPressed()) {
+				if (client.currentScreen == null) {
+					ClientMarks.create(ClientConfig.favoriteType(), ClientMarks.aimPoint(client));
+				}
+			}
+			while (deleteKey.wasPressed()) {
+				if (client.currentScreen == null) ClientMarks.removeLookedAt();
+			}
+			while (settingsKey.wasPressed()) {
+				if (client.currentScreen == null) {
+					client.setScreen(new SettingsScreen(null));
+				}
+			}
+		});
+
+		HudRenderCallback.EVENT.register((ctx, tickCounter) -> MarkRenderer.render(ctx));
+	}
+}
+=== FILE: src/main/java/com/markpoint/client/MarkRenderer.java ===
+package com.markpoint.client;
+
+import com.markpoint.MarkData;
+import com.markpoint.MarkType;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.text.Text;
+import net.minecraft.util.Util;
+import net.minecraft.util.math.Vec3d;
+
+public final class MarkRenderer {
+	private static final String[] CARDINALS = {"S", "SW", "W", "NW", "N", "NE", "E", "SE"};
+	private static final int MARGIN = 14;
+
+	private MarkRenderer() {
+	}
+
+	public static void render(DrawContext ctx) {
+		MinecraftClient mc = MinecraftClient.getInstance();
+		if (mc.player == null || mc.options.hudHidden || ClientMarks.all().isEmpty()) return;
+		ClientMarks.prune();
+
+		Vec3d eye = mc.player.getEyePos();
+		double yr = Math.toRadians(mc.player.getYaw());
+		double pr = Math.toRadians(mc.player.getPitch());
+		// camera basis (Minecraft yaw/pitch convention)
+		double fx = -Math.sin(yr) * Math.cos(pr), fy = -Math.sin(pr), fz = Math.cos(yr) * Math.cos(pr);
+		double rx = -Math.cos(yr), ry = 0, rz = -Math.sin(yr);
+		double ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+
+		int w = ctx.getScaledWindowWidth();
+		int h = ctx.getScaledWindowHeight();
+		double fov = mc.options.getFov().getValue();
+		double focal = (h / 2.0) / Math.tan(Math.toRadians(fov) / 2.0);
+		java.util.UUID me = mc.player.getUuid();
+		long now = System.currentTimeMillis();
+		double pulse = ClientConfig.animations ? 1.0 + 0.12 * Math.sin(Util.getMeasuringTimeMs() / 220.0) : 1.0;
+
+		for (ClientMarks.Mark m : ClientMarks.all()) {
+			MarkData d = m.data;
+			MarkType type = MarkType.byOrdinal(d.type());
+			if (!ClientConfig.enabled(type)) continue;
+
+			double dx = d.x() - eye.x, dy = d.y() - eye.y, dz = d.z() - eye.z;
+			double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+			if (dist > ClientConfig.maxDistance) continue;
+
+			double zc = dx * fx + dy * fy + dz * fz;
+			double xc = dx * rx + dy * ry + dz * rz;
+			double yc = dx * ux + dy * uy + dz * uz;
+
+			double sx = 0, sy = 0;
+			boolean onScreen = false;
+			if (zc > 0.1) {
+				sx = w / 2.0 + xc / zc * focal;
+				sy = h / 2.0 - yc / zc * focal;
+				onScreen = sx >= MARGIN && sx <= w - MARGIN && sy >= MARGIN && sy <= h - MARGIN;
+			}
+			if (!onScreen) {
+				if (!ClientConfig.showOffscreen) continue;
+				double vx = xc, vy = -yc;
+				double hx = w / 2.0 - MARGIN, hy = h / 2.0 - MARGIN;
+				double len = Math.max(Math.abs(vx) / hx, Math.abs(vy) / hy);
+				if (len < 1e-9) {
+					vx = 0;
+					vy = 1;
+					len = 1.0 / hy;
+				}
+				sx = w / 2.0 + vx / len;
+				sy = h / 2.0 + vy / len;
+			}
+
+			int color = (d.color() & 0x00FFFFFF) | 0xFF000000;
+			int half = Math.max(2, (int) Math.round((onScreen ? 4.0 : 3.0) * ClientConfig.scale * pulse));
+			int x = (int) Math.round(sx), y = (int) Math.round(sy);
+
+			ctx.fill(x - half - 1, y - half - 1, x + half + 1, y + half + 1, 0xFF000000);
+			ctx.fill(x - half, y - half, x + half, y + half, color);
+			ctx.fill(x - 1, y + half + 1, x + 1, y + half + 5, 0xFF000000); // small pin
+			ctx.fill(x, y + half + 1, x + 1, y + half + 4, color);
+
+			if (!onScreen) continue;
+
+			// name line (label + owner)
+			String name = ClientMarks.displayLabel(d);
+			if (ClientConfig.showOwner && !d.owner().equals(me) && !d.ownerName().isEmpty()) {
+				name += " (" + d.ownerName() + ")";
+			}
+			ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(name), x, y - half - 12, color);
+
+			// info line: direction, distance, remaining time
+			StringBuilder info = new StringBuilder();
+			info.append(cardinal(dx, dz));
+			if (ClientConfig.showDistance) info.append("  ").append((int) dist).append("m");
+			if (m.expiresAt > 0) {
+				long sec = Math.max(0, (m.expiresAt - now + 999) / 1000);
+				info.append("  ").append(sec >= 60 ? (sec / 60) + "m" + (sec % 60) + "s" : sec + "s");
+			}
+			ctx.drawCenteredTextWithShadow(mc.textRenderer, Text.literal(info.toString()),
+					x, y + half + 8, 0xFFFFFFFF);
+		}
+	}
+
+	private static String cardinal(double dx, double dz) {
+		double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+		int idx = (int) Math.floor((((yaw + 22.5) % 360) + 360) % 360 / 45.0) % 8;
+		return CARDINALS[idx];
+	}
+}
+=== FILE: src/main/java/com/markpoint/client/SettingsScreen.java ===
+package com.markpoint.client;
+
+import com.markpoint.MarkType;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.TextFieldWidget;
+import net.minecraft.text.Text;
+
+import java.util.function.Supplier;
+
+public class SettingsScreen extends Screen {
+	private final Screen parent;
+	private int page = 0; // 0 = general, 1 = mark types
+	private int row;
+
+	public SettingsScreen(Screen parent) {
+		super(Text.translatable("markpoint.settings.title"));
+		this.parent = parent;
+	}
+
+	private static Text onOff(boolean v) {
+		return Text.translatable(v ? "markpoint.on" : "markpoint.off");
+	}
+
+	private void button(int col, int y, int w, Supplier<Text> label, Runnable action) {
+		int x = width / 2 - 154 + col * 156;
+		addDrawableChild(ButtonWidget.builder(label.get(), b -> {
+			action.run();
+			clearAndInit();
+		}).dimensions(x, y, w, 20).build());
+	}
+
+	@Override
+	protected void init() {
+		int top = 36;
+		addDrawableChild(ButtonWidget.builder(Text.translatable("markpoint.settings.page.general"),
+				b -> {
+					page = 0;
+					clearAndInit();
+				}).dimensions(width / 2 - 154, 8, 150, 20).build());
+		addDrawableChild(ButtonWidget.builder(Text.translatable("markpoint.settings.page.types"),
+				b -> {
+					page = 1;
+					clearAndInit();
+				}).dimensions(width / 2 + 2, 8, 150, 20).build());
+
+		if (page == 0) {
+			button(0, top, 150, () -> Text.translatable("markpoint.settings.duration", durationText()),
+					() -> ClientConfig.duration = ClientConfig.cycle(ClientConfig.DURATIONS, ClientConfig.duration));
+			button(1, top, 150, () -> Text.translatable("markpoint.settings.distance", ClientConfig.maxDistance),
+					() -> ClientConfig.maxDistance = ClientConfig.cycle(ClientConfig.DISTANCES, ClientConfig.maxDistance));
+			button(0, top + 24, 150, () -> Text.translatable("markpoint.settings.scale", ClientConfig.scale),
+					() -> ClientConfig.scale = ClientConfig.cycle(ClientConfig.SCALES, ClientConfig.scale));
+			button(1, top + 24, 150, () -> Text.translatable("markpoint.settings.sounds", onOff(ClientConfig.sounds)),
+					() -> ClientConfig.sounds = !ClientConfig.sounds);
+			button(0, top + 48, 150, () -> Text.translatable("markpoint.settings.animations", onOff(ClientConfig.animations)),
+					() -> ClientConfig.animations = !ClientConfig.animations);
+			button(1, top + 48, 150, () -> Text.translatable("markpoint.settings.showDistance", onOff(ClientConfig.showDistance)),
+					() -> ClientConfig.showDistance = !ClientConfig.showDistance);
+			button(0, top + 72, 150, () -> Text.translatable("markpoint.settings.showOwner", onOff(ClientConfig.showOwner)),
+					() -> ClientConfig.showOwner = !ClientConfig.showOwner);
+			button(1, top + 72, 150, () -> Text.translatable("markpoint.settings.showOffscreen", onOff(ClientConfig.showOffscreen)),
+					() -> ClientConfig.showOffscreen = !ClientConfig.showOffscreen);
+			button(0, top + 96, 150, () -> Text.translatable("markpoint.settings.favorite",
+							Text.translatable(ClientConfig.favoriteType().key())),
+					() -> ClientConfig.favorite = (ClientConfig.favorite + 1) % MarkType.values().length);
+		} else {
+			MarkType[] types = MarkType.values();
+			for (int i = 0; i < types.length; i++) {
+				final MarkType t = types[i];
+				int y = top + (i / 2) * 24;
+				int col = i % 2;
+				int x = width / 2 - 154 + col * 156;
+				addDrawableChild(ButtonWidget.builder(
+						Text.translatable(t.key()).append(Text.literal(": ")).append(onOff(ClientConfig.enabled(t))),
+						b -> {
+							ClientConfig.toggle(t);
+							clearAndInit();
+						}).dimensions(x, y, 100, 20).build());
+				final int c = ClientConfig.colors[t.ordinal()];
+				addDrawableChild(ButtonWidget.builder(
+						Text.literal("██").styled(s -> s.withColor(c & 0xFFFFFF)),
+						b -> {
+							ClientConfig.colors[t.ordinal()] =
+									ClientConfig.cycle(ClientConfig.PALETTE, ClientConfig.colors[t.ordinal()]);
+							clearAndInit();
+						}).dimensions(x + 104, y, 46, 20).build());
+			}
+			int fy = top + 4 * 24 + 8;
+			TextFieldWidget labelField = new TextFieldWidget(textRenderer, width / 2 - 154, fy, 150, 20,
+					Text.translatable("markpoint.settings.customLabel"));
+			labelField.setMaxLength(32);
+			labelField.setText(ClientConfig.customLabel);
+			labelField.setChangedListener(s -> ClientConfig.customLabel = s);
+			addDrawableChild(labelField);
+
+			int ci = MarkType.CUSTOM.ordinal();
+			TextFieldWidget colorField = new TextFieldWidget(textRenderer, width / 2 + 2, fy, 150, 20,
+					Text.translatable("markpoint.settings.customColor"));
+			colorField.setMaxLength(6);
+			colorField.setText(String.format("%06X", ClientConfig.colors[ci] & 0xFFFFFF));
+			colorField.setChangedListener(s -> {
+				try {
+					if (s.length() == 6) ClientConfig.colors[ci] = Integer.parseInt(s, 16) | 0xFF000000;
+				} catch (NumberFormatException ignored) {
+				}
+			});
+			addDrawableChild(colorField);
+		}
+
+		addDrawableChild(ButtonWidget.builder(Text.translatable("markpoint.settings.done"), b -> close())
+				.dimensions(width / 2 - 100, height - 28, 200, 20).build());
+	}
+
+	private Text durationText() {
+		if (ClientConfig.duration == 0) return Text.translatable("markpoint.permanent");
+		int d = ClientConfig.duration;
+		return Text.literal(d >= 60 ? (d / 60) + "m" : d + "s");
+	}
+
+	@Override
+	public void render(DrawContext ctx, int mx, int my, float delta) {
+		super.render(ctx, mx, my, delta);
+		if (page == 1) {
+			int fy = 36 + 4 * 24 + 8;
+			ctx.drawTextWithShadow(textRenderer, Text.translatable("markpoint.settings.customLabel"),
+					width / 2 - 154, fy - 11, 0xFFAAAAAA);
+			ctx.drawTextWithShadow(textRenderer, Text.translatable("markpoint.settings.customColor"),
+					width / 2 + 2, fy - 11, 0xFFAAAAAA);
+		}
+	}
+
+	@Override
+	public void removed() {
+		ClientConfig.save();
+	}
+
+	@Override
+	public void close() {
+		if (client != null) client.setScreen(parent);
+	}
+}
+=== FILE: src/main/java/com/markpoint/client/WheelScreen.java ===
+package com.markpoint.client;
+
+import com.markpoint.MarkType;
+import net.minecraft.client.gui.Click;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.text.Text;
+import net.minecraft.util.Util;
+import net.minecraft.util.math.Vec3d;
+
+import java.util.List;
+
+/** Radial wheel: pick a mark type with the mouse. Click the centre to delete your marks. */
+public class WheelScreen extends Screen {
+	private final Vec3d target;
+	private final List<MarkType> types = ClientConfig.enabledTypes();
+	private final long opened;
+
+	public WheelScreen(Vec3d target) {
+		super(Text.translatable("markpoint.wheel.title"));
+		this.target = target;
+		this.opened = Util.getMeasuringTimeMs();
+	}
+
+	@Override
+	public boolean shouldPause() {
+		return false;
+	}
+
+	private float progress() {
+		if (!ClientConfig.animations) return 1f;
+		float t = Math.min(1f, (Util.getMeasuringTimeMs() - opened) / 180f);
+		return 1f - (1f - t) * (1f - t) * (1f - t); // ease-out
+	}
+
+	/** Index of hovered segment, -1 for centre / nothing. */
+	private int hover(double mx, double my) {
+		if (types.isEmpty()) return -1;
+		double dx = mx - width / 2.0, dy = my - height / 2.0;
+		if (Math.hypot(dx, dy) < 22) return -1;
+		double a = Math.atan2(dy, dx) + Math.PI / 2;
+		double full = Math.PI * 2;
+		double seg = full / types.size();
+		a = ((a % full) + full) % full;
+		return (int) Math.round(a / seg) % types.size();
+	}
+
+	@Override
+	public void render(DrawContext ctx, int mx, int my, float delta) {
+		float p = progress();
+		int alpha = (int) (0x70 * p);
+		ctx.fill(0, 0, width, height, alpha << 24);
+
+		int cx = width / 2, cy = height / 2;
+		int n = types.size();
+		double radius = 70 * p;
+		int hov = hover(mx, my);
+		boolean centerHover = Math.hypot(mx - cx, my - cy) < 22;
+
+		// centre button (delete my marks)
+		int cbox = 14;
+		ctx.fill(cx - cbox - 1, cy - cbox - 1, cx + cbox + 1, cy + cbox + 1, centerHover ? 0xFFFFFFFF : 0xFF000000);
+		ctx.fill(cx - cbox, cy - cbox, cx + cbox, cy + cbox, centerHover ? 0xFFB71C1C : 0xFF3A3A3A);
+		ctx.drawCenteredTextWithShadow(textRenderer, Text.literal("X"), cx, cy - 4, 0xFFFFFFFF);
+
+		for (int i = 0; i < n; i++) {
+			MarkType t = types.get(i);
+			double ang = -Math.PI / 2 + i * (Math.PI * 2 / n);
+			int ix = cx + (int) Math.round(Math.cos(ang) * radius);
+			int iy = cy + (int) Math.round(Math.sin(ang) * radius);
+			boolean hv = i == hov;
+			int half = hv ? 20 : 17;
+			int color = ClientConfig.colors[t.ordinal()] | 0xFF000000;
+			ctx.fill(ix - half - 2, iy - half - 2, ix + half + 2, iy + half + 2, hv ? 0xFFFFFFFF : 0xFF000000);
+			ctx.fill(ix - half, iy - half, ix + half, iy + half, color);
+			if (t == ClientConfig.favoriteType()) {
+				ctx.drawCenteredTextWithShadow(textRenderer, Text.literal("*"), ix, iy - half + 3, 0xFF000000);
+			}
+			if (p > 0.6f) {
+				ctx.drawCenteredTextWithShadow(textRenderer, Text.translatable(t.key()), ix, iy + half + 5,
+						hv ? 0xFFFFFFFF : 0xFFBBBBBB);
+			}
+		}
+	}
+
+	@Override
+	public boolean mouseClicked(Click click, boolean doubled) {
+		if (click.button() == 0) {
+			double mx = click.x(), my = click.y();
+			int h = hover(mx, my);
+			if (h >= 0) {
+				ClientMarks.create(types.get(h), target);
+				close();
+				return true;
+			}
+			if (Math.hypot(mx - width / 2.0, my - height / 2.0) < 22) {
+				ClientMarks.clearMine();
+				close();
+				return true;
+			}
+		}
+		close();
+		return true;
+	}
+}
+=== FILE: src/main/resources/fabric.mod.json ===
+{
+  "schemaVersion": 1,
+  "id": "markpoint",
+  "version": "${version}",
+  "name": "MarkPoint",
+  "description": "Ping & waypoint system for Minecraft: mark locations, enemies, danger, resources and chests with visual signals. Local or shared via server sync.",
+  "authors": ["MarkPoint Team"],
+  "contact": {
+    "homepage": "https://modrinth.com/mod/markpoint"
+  },
+  "license": "MIT",
+  "icon": "assets/markpoint/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.markpoint.MarkPointMod"],
+    "client": ["com.markpoint.client.MarkPointClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
+=== B64: src/main/resources/assets/markpoint/icon.png ===
+iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAABWklEQVR42u3dwY3CQBBFQWdGvATIGYsQLAbknldP2gT6122BOQ5JkiRJkiRJkiRJkiRJ2qbH8/V2hc0H/vbPFYOjw2B4EIwOg/EhMDwIxofA+BAYHgTjQ2B8CAAAwPgQGB8C40MAAADGh8D4EAAAAAAAjBv/EwQRAFcCIDw+BBsBWBEAQwGsDIDw+BAAAMAkAL8MgJsD+EcAAAAAAAAAAAAAAMTGhwAC4wMAAAAAAAAAAAD4XwAA/hsIAAAA+ESQ8X0mEACfCgbA9wKM75tBAPhuoPEBAAAAACAwPgTGBwAACIzvl0Llt4IFgLwXIC+GyJtB8mqYvBsoL4cKAHk8WvMQuD4AqiJwdQBUReDaAKiKwJXDCFwXAFURuCoAqiJwTQBUReCKYQSuB4CqCFwNAFURuBYAqiJwpTAC1wFAVQSuAoCqCFwDAFURuAIAkiRJkiRJkiRJkiTt1AmPypru7b0J8gAAAABJRU5ErkJggg==
+=== FILE: src/main/resources/assets/markpoint/lang/ar_sa.json ===
+{
+  "key.category.markpoint.main": "MarkPoint",
+  "key.markpoint.wheel": "فتح عجلة الإشارات",
+  "key.markpoint.quick": "إشارة سريعة (النوع المفضل)",
+  "key.markpoint.delete": "حذف الإشارة اللي تشوفها",
+  "key.markpoint.settings": "فتح إعدادات MarkPoint",
+
+  "markpoint.type.location": "موقع",
+  "markpoint.type.enemy": "عدو",
+  "markpoint.type.danger": "خطر",
+  "markpoint.type.resource": "موارد",
+  "markpoint.type.chest": "صندوق",
+  "markpoint.type.help": "مساعدة!",
+  "markpoint.type.goto": "اتجه هنا",
+  "markpoint.type.custom": "مخصصة",
+
+  "markpoint.wheel.title": "عجلة الإشارات",
+  "markpoint.on": "مفعّل",
+  "markpoint.off": "معطّل",
+  "markpoint.permanent": "دائمة",
+
+  "markpoint.settings.title": "إعدادات MarkPoint",
+  "markpoint.settings.page.general": "عام",
+  "markpoint.settings.page.types": "الأنواع والألوان",
+  "markpoint.settings.duration": "المدة: %s",
+  "markpoint.settings.distance": "مسافة الظهور: %s",
+  "markpoint.settings.scale": "حجم العلامة: x%s",
+  "markpoint.settings.sounds": "الأصوات: %s",
+  "markpoint.settings.animations": "الحركات: %s",
+  "markpoint.settings.showDistance": "عرض المسافة: %s",
+  "markpoint.settings.showOwner": "عرض اسم اللاعب: %s",
+  "markpoint.settings.showOffscreen": "مؤشرات الأطراف: %s",
+  "markpoint.settings.favorite": "المفضلة: %s",
+  "markpoint.settings.customLabel": "اسم الإشارة المخصصة",
+  "markpoint.settings.customColor": "لون الإشارة المخصصة (HEX)",
+  "markpoint.settings.done": "تم"
+}
+=== FILE: src/main/resources/assets/markpoint/lang/en_us.json ===
+{
+  "key.category.markpoint.main": "MarkPoint",
+  "key.markpoint.wheel": "Open mark wheel",
+  "key.markpoint.quick": "Quick mark (favorite type)",
+  "key.markpoint.delete": "Delete the mark you are looking at",
+  "key.markpoint.settings": "Open MarkPoint settings",
+
+  "markpoint.type.location": "Location",
+  "markpoint.type.enemy": "Enemy",
+  "markpoint.type.danger": "Danger",
+  "markpoint.type.resource": "Resources",
+  "markpoint.type.chest": "Chest",
+  "markpoint.type.help": "Help!",
+  "markpoint.type.goto": "Go here",
+  "markpoint.type.custom": "Custom",
+
+  "markpoint.wheel.title": "Mark Wheel",
+  "markpoint.on": "ON",
+  "markpoint.off": "OFF",
+  "markpoint.permanent": "Permanent",
+
+  "markpoint.settings.title": "MarkPoint Settings",
+  "markpoint.settings.page.general": "General",
+  "markpoint.settings.page.types": "Mark types & colors",
+  "markpoint.settings.duration": "Duration: %s",
+  "markpoint.settings.distance": "View distance: %s",
+  "markpoint.settings.scale": "Marker size: x%s",
+  "markpoint.settings.sounds": "Sounds: %s",
+  "markpoint.settings.animations": "Animations: %s",
+  "markpoint.settings.showDistance": "Show distance: %s",
+  "markpoint.settings.showOwner": "Show owner: %s",
+  "markpoint.settings.showOffscreen": "Edge indicators: %s",
+  "markpoint.settings.favorite": "Favorite: %s",
+  "markpoint.settings.customLabel": "Custom mark name",
+  "markpoint.settings.customColor": "Custom color (HEX)",
+  "markpoint.settings.done": "Done"
+}
